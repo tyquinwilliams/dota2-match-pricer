@@ -3,7 +3,7 @@ import random
 import time
 from collections import Counter
 from pathlib import Path
-
+from opendota_client import fetch_json
 import requests
 
 
