@@ -1,24 +1,61 @@
-import requests
 import json
 from pathlib import Path
 
-API_URL = "https://api.opendota.com/api/proMatches"
+from opendota_client import fetch_json
 
-response = requests.get(API_URL, timeout=15)
-response.raise_for_status()
 
-matches = response.json()
+# ==========================================
+# 1. CONFIGURATION
+# ==========================================
 
-print(f"Successfully retrieved {len(matches)} professional matches")
+OUTPUT_DIR = Path("data/raw")
+OUTPUT_FILE = OUTPUT_DIR / "pro_matches.json"
 
-# Create a directory for raw API responses
-output_dir = Path("data/raw")
-output_dir.mkdir(parents=True, exist_ok=True)
 
-# Save the original API response
-output_file = output_dir / "pro_matches.json"
+# ==========================================
+# 2. FETCH PROFESSIONAL MATCHES
+# ==========================================
 
-with open(output_file, "w", encoding="utf-8") as file:
-    json.dump(matches, file, indent=2)
+def fetch_pro_matches():
+    matches = fetch_json("proMatches")
 
-print(f"Saved {len(matches)} matches to {output_file}")
+    if matches is None:
+        print("Failed to retrieve professional matches.")
+        return None
+
+    print(
+        f"Successfully retrieved "
+        f"{len(matches)} professional matches"
+    )
+
+    return matches
+
+
+# ==========================================
+# 3. SAVE RAW DATA
+# ==========================================
+
+def save_raw_matches(matches):
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    with OUTPUT_FILE.open("w", encoding="utf-8") as file:
+        json.dump(matches, file, indent=2)
+
+    print(f"Saved {len(matches)} matches to {OUTPUT_FILE}")
+
+
+# ==========================================
+# 4. MAIN
+# ==========================================
+
+def main():
+    matches = fetch_pro_matches()
+
+    if matches is None:
+        return
+
+    save_raw_matches(matches)
+
+
+if __name__ == "__main__":
+    main()
