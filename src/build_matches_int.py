@@ -6,9 +6,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 RAW_FILE = Path("data/raw/pro_matches.json")
+RECOVERY_FILE = Path("data/intermediate/team_id_recovery.csv")
 OUTPUT_FILE = Path("data/intermediate/matches_int.csv")
 
-# Reject timestamps earlier than Dota 2's release year.
 MIN_TIMESTAMP = int(
     datetime(2013, 1, 1, tzinfo=timezone.utc).timestamp()
 )
@@ -20,6 +20,8 @@ FIELDS = [
     "duration_seconds",
     "radiant_team_id",
     "dire_team_id",
+    "radiant_team_id_effective",
+    "dire_team_id_effective",
     "radiant_team_name",
     "dire_team_name",
     "league_id",
@@ -67,7 +69,101 @@ def to_utc(timestamp):
     ).isoformat()
 
 
-def transform_match(match):
+def parse_positive_int(value):
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+
+    return parsed if parsed > 0 else None
+
+
+def load_recoveries(raw_matches):
+    if not RECOVERY_FILE.exists():
+        return {}
+
+    matches_by_id = {
+        match["match_id"]: match
+        for match in raw_matches
+        if valid_positive_int(match.get("match_id"))
+    }
+
+    recoveries = {}
+
+    with RECOVERY_FILE.open(
+        "r", encoding="utf-8-sig", newline=""
+    ) as file:
+        reader = csv.DictReader(file)
+
+        for row in reader:
+            target_id = parse_positive_int(
+                row.get("target_match_id")
+            )
+            reference_id = parse_positive_int(
+                row.get("reference_match_id")
+            )
+            candidate_id = parse_positive_int(
+                row.get("team_id_candidate")
+            )
+            matched_players = parse_positive_int(
+                row.get("matched_players")
+            )
+
+            side = (row.get("side") or "").strip().lower()
+            status = (
+                row.get("recovery_status") or ""
+            ).strip().lower()
+
+            if (
+                target_id is None
+                or reference_id is None
+                or candidate_id is None
+                or matched_players != 5
+                or side not in ("radiant", "dire")
+                or status != "accepted"
+            ):
+                continue
+
+            target = matches_by_id.get(target_id)
+            reference = matches_by_id.get(reference_id)
+
+            if target is None or reference is None:
+                continue
+
+            target_time = target.get("start_time")
+            reference_time = reference.get("start_time")
+
+            if (
+                not valid_timestamp(target_time)
+                or not valid_timestamp(reference_time)
+                or reference_time >= target_time
+            ):
+                continue
+
+            key = (target_id, side)
+            recoveries.setdefault(key, set()).add(
+                candidate_id
+            )
+
+    return recoveries
+
+
+def effective_team_id(original_id, recovery_candidates):
+    if valid_positive_int(original_id):
+        return original_id, "original"
+
+    if len(recovery_candidates) == 1:
+        return next(iter(recovery_candidates)), "recovered"
+
+    if len(recovery_candidates) > 1:
+        return None, "ambiguous"
+
+    return None, "unresolved"
+
+
+def transform_match(match, recoveries=None):
+    recoveries = recoveries or {}
+
     issues = []
 
     match_id = match.get("match_id")
@@ -77,6 +173,16 @@ def transform_match(match):
     radiant_id = match.get("radiant_team_id")
     dire_id = match.get("dire_team_id")
     radiant_win = match.get("radiant_win")
+
+    radiant_effective, radiant_source = effective_team_id(
+        radiant_id,
+        recoveries.get((match_id, "radiant"), set()),
+    )
+
+    dire_effective, dire_source = effective_team_id(
+        dire_id,
+        recoveries.get((match_id, "dire"), set()),
+    )
 
     if not valid_positive_int(match_id):
         issues.append("missing_or_invalid_match_id")
@@ -88,13 +194,19 @@ def transform_match(match):
         issues.append("missing_or_invalid_duration")
 
     has_teams = (
-        valid_positive_int(radiant_id)
-        and valid_positive_int(dire_id)
-        and radiant_id != dire_id
+        valid_positive_int(radiant_effective)
+        and valid_positive_int(dire_effective)
+        and radiant_effective != dire_effective
     )
 
     if not has_teams:
         issues.append("missing_or_invalid_team_id")
+
+    if (
+        radiant_source == "ambiguous"
+        or dire_source == "ambiguous"
+    ):
+        issues.append("ambiguous_team_identity")
 
     has_outcome = isinstance(radiant_win, bool)
 
@@ -107,7 +219,15 @@ def transform_match(match):
 
     if has_teams and has_outcome:
         winning_team_id = (
-            radiant_id if radiant_win else dire_id
+            radiant_effective if radiant_win
+            else dire_effective
+        )
+
+    if radiant_source == dire_source:
+        team_id_source = radiant_source
+    else:
+        team_id_source = (
+            f"radiant:{radiant_source};dire:{dire_source}"
         )
 
     return {
@@ -117,6 +237,8 @@ def transform_match(match):
         "duration_seconds": duration,
         "radiant_team_id": radiant_id,
         "dire_team_id": dire_id,
+        "radiant_team_id_effective": radiant_effective,
+        "dire_team_id_effective": dire_effective,
         "radiant_team_name": match.get("radiant_name"),
         "dire_team_name": match.get("dire_name"),
         "league_id": match.get("leagueid"),
@@ -127,9 +249,7 @@ def transform_match(match):
         "dire_score": match.get("dire_score"),
         "radiant_win": radiant_win,
         "winning_team_id": winning_team_id,
-        "team_id_source": (
-            "original" if has_teams else "unresolved"
-        ),
+        "team_id_source": team_id_source,
         "eligible_for_team_elo": eligible,
         "validation_issues": ";".join(issues),
     }
@@ -154,8 +274,10 @@ def main():
     with RAW_FILE.open("r", encoding="utf-8") as file:
         raw_matches = json.load(file)
 
+    recoveries = load_recoveries(raw_matches)
+
     transformed = [
-        transform_match(match)
+        transform_match(match, recoveries)
         for match in raw_matches
     ]
 
