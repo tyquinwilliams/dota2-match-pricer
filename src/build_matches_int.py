@@ -1,11 +1,17 @@
 
 import csv
 import json
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
 RAW_FILE = Path("data/raw/pro_matches.json")
 OUTPUT_FILE = Path("data/intermediate/matches_int.csv")
+
+# Reject timestamps earlier than Dota 2's release year.
+MIN_TIMESTAMP = int(
+    datetime(2013, 1, 1, tzinfo=timezone.utc).timestamp()
+)
 
 FIELDS = [
     "match_id",
@@ -26,11 +32,34 @@ FIELDS = [
     "winning_team_id",
     "team_id_source",
     "eligible_for_team_elo",
+    "validation_issues",
 ]
 
 
+def valid_positive_int(value):
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and value > 0
+    )
+
+
+def valid_timestamp(value):
+    if not valid_positive_int(value):
+        return False
+
+    if value < MIN_TIMESTAMP:
+        return False
+
+    try:
+        datetime.fromtimestamp(value, tz=timezone.utc)
+        return True
+    except (ValueError, OverflowError, OSError):
+        return False
+
+
 def to_utc(timestamp):
-    if timestamp is None:
+    if not valid_timestamp(timestamp):
         return None
 
     return datetime.fromtimestamp(
@@ -39,24 +68,40 @@ def to_utc(timestamp):
 
 
 def transform_match(match):
+    issues = []
+
+    match_id = match.get("match_id")
+    start_time = match.get("start_time")
+    duration = match.get("duration")
+
     radiant_id = match.get("radiant_team_id")
     dire_id = match.get("dire_team_id")
     radiant_win = match.get("radiant_win")
 
+    if not valid_positive_int(match_id):
+        issues.append("missing_or_invalid_match_id")
+
+    if not valid_timestamp(start_time):
+        issues.append("missing_or_invalid_timestamp")
+
+    if not valid_positive_int(duration):
+        issues.append("missing_or_invalid_duration")
+
     has_teams = (
-        radiant_id is not None
-        and dire_id is not None
+        valid_positive_int(radiant_id)
+        and valid_positive_int(dire_id)
         and radiant_id != dire_id
     )
 
+    if not has_teams:
+        issues.append("missing_or_invalid_team_id")
+
     has_outcome = isinstance(radiant_win, bool)
 
-    eligible = (
-        match.get("match_id") is not None
-        and match.get("start_time") is not None
-        and has_teams
-        and has_outcome
-    )
+    if not has_outcome:
+        issues.append("missing_or_invalid_outcome")
+
+    eligible = len(issues) == 0
 
     winning_team_id = None
 
@@ -66,10 +111,10 @@ def transform_match(match):
         )
 
     return {
-        "match_id": match.get("match_id"),
-        "start_time": match.get("start_time"),
-        "start_time_utc": to_utc(match.get("start_time")),
-        "duration_seconds": match.get("duration"),
+        "match_id": match_id,
+        "start_time": start_time,
+        "start_time_utc": to_utc(start_time),
+        "duration_seconds": duration,
         "radiant_team_id": radiant_id,
         "dire_team_id": dire_id,
         "radiant_team_name": match.get("radiant_name"),
@@ -86,7 +131,19 @@ def transform_match(match):
             "original" if has_teams else "unresolved"
         ),
         "eligible_for_team_elo": eligible,
+        "validation_issues": ";".join(issues),
     }
+
+
+def sort_key(match):
+    timestamp = match["start_time"]
+    match_id = match["match_id"]
+
+    return (
+        not valid_timestamp(timestamp),
+        timestamp if valid_timestamp(timestamp) else 0,
+        match_id if valid_positive_int(match_id) else 0,
+    )
 
 
 def main():
@@ -102,13 +159,7 @@ def main():
         for match in raw_matches
     ]
 
-    transformed.sort(
-        key=lambda match: (
-            match["start_time"] is None,
-            match["start_time"] or 0,
-            match["match_id"] or 0,
-        )
-    )
+    transformed.sort(key=sort_key)
 
     OUTPUT_FILE.parent.mkdir(
         parents=True, exist_ok=True
@@ -128,10 +179,28 @@ def main():
         for match in transformed
     )
 
+    issue_counts = Counter()
+
+    for match in transformed:
+        if match["validation_issues"]:
+            issue_counts.update(
+                match["validation_issues"].split(";")
+            )
+
     print(f"Raw matches: {len(raw_matches)}")
     print(f"Intermediate matches: {len(transformed)}")
     print(f"Eligible for Elo: {eligible_count}")
-    print(f"Saved to: {OUTPUT_FILE}")
+    print(f"Ineligible for Elo: {len(transformed) - eligible_count}")
+
+    print("\nValidation issues:")
+
+    if issue_counts:
+        for issue, count in sorted(issue_counts.items()):
+            print(f"  {issue}: {count}")
+    else:
+        print("  None")
+
+    print(f"\nSaved to: {OUTPUT_FILE}")
 
 
 if __name__ == "__main__":
