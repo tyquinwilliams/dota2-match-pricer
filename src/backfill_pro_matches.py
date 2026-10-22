@@ -1,269 +1,313 @@
 
-"""
-Historical professional Dota 2 match backfill.
-
-Day 24:
-- Fetch older professional matches from OpenDota.
-- Save historical records after each page.
-- Write a checkpoint after each successful save.
-- Resume collection after interruption.
-- Preserve existing historical records.
-
-Retries and enhanced failure logging are scheduled for Day 25.
-"""
-
 import argparse
 import json
 import os
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 from opendota_client import fetch_json
 
 
-RECENT_FILE = Path("data/raw/pro_matches.json")
-HISTORY_FILE = Path("data/raw/pro_matches_history.json")
-CHECKPOINT_FILE = Path("data/intermediate/backfill_checkpoint.json")
+ROOT = Path(__file__).resolve().parents[1]
+RECENT_FILE = ROOT / "data/raw/pro_matches.json"
+BATCH_DIR = ROOT / "data/raw/pro_matches_history"
+CHECKPOINT_FILE = ROOT / "data/intermediate/backfill_checkpoint.json"
+SNAPSHOT_DIR = ROOT / "data/snapshots"
 
-DEFAULT_PAGES = 3
-MAX_PAGES = 20
+DEFAULT_START_DATE = "2023-01-01"
+BATCH_SIZE = 100
 
 
-def valid_match_id(value):
-    return (
-        isinstance(value, int)
-        and not isinstance(value, bool)
-        and value > 0
+def write_json_atomic(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+
+    with temporary.open("w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+
+    os.replace(temporary, path)
+
+
+def read_json(path):
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def match_id(match):
+    try:
+        return int(match["match_id"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def match_date(match):
+    try:
+        timestamp = int(match["start_time"])
+        return datetime.fromtimestamp(
+            timestamp, tz=timezone.utc
+        ).date()
+    except (KeyError, TypeError, ValueError, OverflowError, OSError):
+        return None
+
+
+def load_recent():
+    if not RECENT_FILE.exists():
+        raise FileNotFoundError(
+            f"Missing recent matches: {RECENT_FILE}"
+        )
+
+    matches = read_json(RECENT_FILE)
+
+    if not isinstance(matches, list):
+        raise ValueError("Recent matches must be a JSON list.")
+
+    valid = [m for m in matches if match_id(m) is not None]
+
+    if not valid:
+        raise ValueError("No valid recent match IDs found.")
+
+    return valid
+
+
+def batch_files():
+    return sorted(BATCH_DIR.glob("batch_*.json"))
+
+
+def load_history():
+    history = {}
+
+    for path in batch_files():
+        matches = read_json(path)
+
+        if not isinstance(matches, list):
+            raise ValueError(f"Invalid batch file: {path}")
+
+        for match in matches:
+            mid = match_id(match)
+
+            if mid is None:
+                raise ValueError(
+                    f"Match without valid ID in {path}"
+                )
+
+            if mid in history and history[mid] != match:
+                raise ValueError(
+                    f"Conflicting match ID {mid} in {path}"
+                )
+
+            history[mid] = match
+
+    return history
+
+
+def next_batch_number():
+    numbers = []
+
+    for path in batch_files():
+        try:
+            numbers.append(int(path.stem.split("_")[-1]))
+        except ValueError:
+            raise ValueError(f"Invalid batch filename: {path}")
+
+    return max(numbers, default=0) + 1
+
+
+def save_checkpoint(history, cursor, target):
+    dates = [
+        match_date(m)
+        for m in history.values()
+        if match_date(m) is not None
+    ]
+
+    write_json_atomic(
+        CHECKPOINT_FILE,
+        {
+            "historical_matches": len(history),
+            "last_match_id": cursor,
+            "oldest_date": (
+                min(dates).isoformat() if dates else None
+            ),
+            "target_date": target.isoformat(),
+            "updated_at": datetime.now(
+                timezone.utc
+            ).isoformat(),
+        },
     )
 
 
-def load_json_list(path):
-    if not path.exists():
-        return []
+def verify():
+    history = load_history()
+    matches = list(history.values())
+    dates = [match_date(m) for m in matches]
+    known_dates = [d for d in dates if d is not None]
 
-    with path.open("r", encoding="utf-8") as file:
-        data = json.load(file)
+    print("\n[VERIFICATION]")
+    print(f"Batch files: {len(batch_files())}")
+    print(f"Unique historical matches: {len(history)}")
+    print(f"Missing dates: {len(matches) - len(known_dates)}")
 
-    if not isinstance(data, list):
-        raise ValueError(f"Expected JSON list: {path}")
+    if known_dates:
+        print(f"Earliest match: {min(known_dates)}")
+        print(f"Latest match: {max(known_dates)}")
 
-    return data
+    if matches:
+        print(f"Oldest match ID: {min(history)}")
+        print(f"Newest match ID: {max(history)}")
 
-
-def atomic_save_json(path, data):
-    """
-    Save JSON using a temporary file followed by replacement.
-
-    The temporary file is created in the same directory
-    so os.replace can replace the destination atomically
-    on the local filesystem.
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    temporary_path = path.with_name(path.name + ".tmp")
-
-    try:
-        with temporary_path.open(
-            "w", encoding="utf-8"
-        ) as file:
-            json.dump(data, file, indent=2)
-            file.flush()
-            os.fsync(file.fileno())
-
-        os.replace(temporary_path, path)
-
-    finally:
-        if temporary_path.exists():
-            temporary_path.unlink()
+    print("Verification completed.")
+    return history
 
 
-def deduplicate_matches(matches):
-    seen = set()
-    unique = []
+def create_snapshots():
+    history = verify()
 
-    for match in matches:
-        if not isinstance(match, dict):
-            continue
+    if not history:
+        print("No historical matches available.")
+        return
 
-        match_id = match.get("match_id")
+    by_year = {}
 
-        if not valid_match_id(match_id):
-            continue
+    for match in history.values():
+        date = match_date(match)
 
-        if match_id in seen:
-            continue
-
-        seen.add(match_id)
-        unique.append(match)
-
-    return unique
-
-
-def oldest_match_id(matches):
-    ids = [
-        match["match_id"]
-        for match in matches
-        if isinstance(match, dict)
-        and valid_match_id(match.get("match_id"))
-    ]
-
-    return min(ids) if ids else None
-
-
-def load_checkpoint():
-    if not CHECKPOINT_FILE.exists():
-        return None
-
-    with CHECKPOINT_FILE.open(
-        "r", encoding="utf-8"
-    ) as file:
-        checkpoint = json.load(file)
-
-    if not isinstance(checkpoint, dict):
-        raise ValueError("Invalid checkpoint format")
-
-    boundary = checkpoint.get("next_boundary")
-
-    if not valid_match_id(boundary):
-        raise ValueError("Invalid checkpoint boundary")
-
-    return checkpoint
-
-
-def save_checkpoint(boundary, total_matches):
-    checkpoint = {
-        "next_boundary": boundary,
-        "total_saved_matches": total_matches,
-        "updated_at_utc": datetime.now(
-            timezone.utc
-        ).isoformat(),
-    }
-
-    atomic_save_json(CHECKPOINT_FILE, checkpoint)
-
-
-def collect_history(pages):
-    if not RECENT_FILE.exists():
-        raise FileNotFoundError(
-            f"Missing recent match data: {RECENT_FILE}"
-        )
-
-    recent = load_json_list(RECENT_FILE)
-    history = load_json_list(HISTORY_FILE)
-
-    recent_boundary = oldest_match_id(recent)
-
-    if recent_boundary is None:
-        raise ValueError(
-            "Recent dataset has no valid match IDs"
-        )
-
-    history_boundary = oldest_match_id(history)
-    checkpoint = load_checkpoint()
-
-    # The saved historical data is the source of truth.
-    # This prevents skipping matches if a checkpoint
-    # exists but the corresponding data was not saved.
-    boundary = recent_boundary
-
-    if history_boundary is not None:
-        boundary = min(boundary, history_boundary)
-
-    if checkpoint is not None:
-        checkpoint_boundary = checkpoint["next_boundary"]
-
-        if checkpoint_boundary >= boundary:
-            print("[CHECKPOINT] Existing checkpoint found")
-        else:
-            print(
-                "[CHECKPOINT WARNING] Checkpoint is ahead "
-                "of saved history; using saved data boundary"
-            )
-
-    print(f"Starting before match ID: {boundary}")
-    print(f"Previously saved historical matches: {len(history)}")
-
-    newly_collected = 0
-
-    for page_number in range(1, pages + 1):
-        print(f"\nFetching historical page {page_number}/{pages}")
-
-        batch = fetch_json(
-            "proMatches",
-            params={"less_than_match_id": boundary},
-        )
-
-        if batch is None:
-            raise RuntimeError(
-                f"Failed to fetch page {page_number}"
-            )
-
-        if not isinstance(batch, list):
+        if date is None:
             raise ValueError(
-                "Unexpected API response: expected list"
+                "Cannot publish snapshots with missing dates."
             )
 
-        if not batch:
-            print("No additional historical matches found.")
-            break
+        by_year.setdefault(date.year, []).append(match)
 
-        valid_batch = [
-            match
-            for match in batch
-            if isinstance(match, dict)
-            and valid_match_id(match.get("match_id"))
-            and match["match_id"] < boundary
-        ]
-
-        if not valid_batch:
-            print("No older valid match IDs in this page.")
-            break
-
-        next_boundary = oldest_match_id(valid_batch)
-
-        if next_boundary is None or next_boundary >= boundary:
-            raise RuntimeError(
-                "Pagination did not advance"
-            )
-
-        combined = deduplicate_matches(
-            history + valid_batch
-        )
-
-        combined.sort(
-            key=lambda match: match["match_id"],
+    for year, matches in sorted(by_year.items()):
+        matches.sort(
+            key=lambda m: match_id(m),
             reverse=True,
         )
 
-        # Save data BEFORE advancing the checkpoint.
-        atomic_save_json(HISTORY_FILE, combined)
-
-        # Only checkpoint successfully saved data.
-        save_checkpoint(
-            boundary=next_boundary,
-            total_matches=len(combined),
+        output = (
+            SNAPSHOT_DIR / f"pro_matches_{year}.json"
         )
 
-        newly_collected += (
-            len(combined) - len(history)
+        write_json_atomic(output, matches)
+
+        print(
+            f"[SNAPSHOT] {output.relative_to(ROOT)} "
+            f"({len(matches)} matches)"
         )
 
-        history = combined
-        boundary = next_boundary
+    print("\nSnapshots created. Not yet committed to Git.")
 
-        print(f"Received records: {len(valid_batch)}")
-        print(f"Total saved: {len(history)}")
-        print(f"Checkpoint boundary: {boundary}")
 
-    print("\nBackfill summary")
-    print(f"New unique matches: {newly_collected}")
-    print(f"Total historical matches: {len(history)}")
-    print(f"Resume boundary: {boundary}")
-    print(f"History file: {HISTORY_FILE}")
-    print(f"Checkpoint file: {CHECKPOINT_FILE}")
+def backfill(pages, target):
+    recent = load_recent()
+    history = load_history()
 
-    return history
+    recent_ids = {
+        match_id(m) for m in recent
+    }
+
+    if history:
+        cursor = min(history)
+    else:
+        cursor = min(recent_ids)
+
+    print("\n[BACKFILL]")
+    print(f"Existing historical matches: {len(history)}")
+    print(f"Starting cursor: {cursor}")
+    print(f"Target date: {target}")
+    print(f"Maximum pages this run: {pages}")
+
+    batch_number = next_batch_number()
+
+    for page in range(1, pages + 1):
+        print(f"\n[PAGE {page}/{pages}]")
+
+        response = fetch_json(
+            "proMatches",
+            params={"less_than_match_id": cursor},
+        )
+
+        if not isinstance(response, list):
+            print("[STOP] API returned an invalid response.")
+            break
+
+        if not response:
+            print("[STOP] No more matches returned.")
+            break
+
+        valid = [
+            m for m in response
+            if match_id(m) is not None
+        ]
+
+        if not valid:
+            print("[STOP] No valid match IDs returned.")
+            break
+
+        next_cursor = min(match_id(m) for m in valid)
+
+        if next_cursor >= cursor:
+            print("[STOP] Pagination cursor did not advance.")
+            break
+
+        new_matches = []
+        reached_target = False
+
+        for match in valid:
+            mid = match_id(match)
+            date = match_date(match)
+
+            if date is None:
+                raise ValueError(
+                    f"Missing date for match {mid}; "
+                    "stopping to avoid an incomplete backfill."
+                )
+
+            if date < target:
+                reached_target = True
+                continue
+
+            if mid not in history and mid not in recent_ids:
+                history[mid] = match
+                new_matches.append(match)
+
+        if new_matches:
+            output = (
+                BATCH_DIR /
+                f"batch_{batch_number:06d}.json"
+            )
+
+            write_json_atomic(output, new_matches)
+            batch_number += 1
+
+        cursor = next_cursor
+        save_checkpoint(history, cursor, target)
+
+        print(f"API records: {len(response)}")
+        print(f"New matches: {len(new_matches)}")
+        print(f"Total historical matches: {len(history)}")
+
+        dates = [
+            match_date(m)
+            for m in valid
+            if match_date(m) is not None
+        ]
+
+        if dates:
+            print(f"Oldest date on page: {min(dates)}")
+
+        if reached_target:
+            print(f"[TARGET REACHED] {target}")
+            break
+
+        if page < pages:
+            time.sleep(1)
+
+    print("\n[RUN COMPLETE]")
+    print(f"Historical matches saved: {len(history)}")
+    print(f"Next cursor: {cursor}")
 
 
 def main():
@@ -274,30 +318,56 @@ def main():
     parser.add_argument(
         "--pages",
         type=int,
-        default=DEFAULT_PAGES,
-        help="Number of pages to fetch",
+        default=1,
+        help="Maximum number of API pages to fetch",
+    )
+
+    parser.add_argument(
+        "--start-date",
+        default=DEFAULT_START_DATE,
+        help="Oldest date to include, YYYY-MM-DD",
+    )
+
+    parser.add_argument(
+        "--verify",
+        action="store_true",
+        help="Verify saved historical batches",
+    )
+
+    parser.add_argument(
+        "--snapshot",
+        action="store_true",
+        help="Create yearly JSON snapshots",
     )
 
     args = parser.parse_args()
 
-    if not 1 <= args.pages <= MAX_PAGES:
-        parser.error(
-            f"--pages must be between 1 and {MAX_PAGES}"
-        )
+    if args.verify:
+        verify()
+        return
+
+    if args.snapshot:
+        create_snapshots()
+        return
+
+    if not 1 <= args.pages <= 20:
+        parser.error("--pages must be between 1 and 20")
 
     try:
-        collect_history(args.pages)
+        target = datetime.strptime(
+            args.start_date, "%Y-%m-%d"
+        ).date()
+    except ValueError:
+        parser.error(
+            "--start-date must use YYYY-MM-DD"
+        )
 
-    except (
-        FileNotFoundError,
-        ValueError,
-        RuntimeError,
-        json.JSONDecodeError,
-        OSError,
-    ) as error:
-        print(f"ERROR: {error}")
-        sys.exit(1)
+    backfill(args.pages, target)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except (OSError, ValueError, KeyError) as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        sys.exit(1)
